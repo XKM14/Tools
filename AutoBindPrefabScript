@@ -1,0 +1,256 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Text;
+using UnityEditor;
+using UnityEditor.Callbacks;
+using UnityEngine;
+using UnityEngine.UI;
+
+public static class AutoBindPrefabScript
+{
+    private static Dictionary<string, string> bindTypeDic = new Dictionary<string, string>()
+    {
+        {"Img", "Image"},
+        {"Txt", "Text"},
+        {"Trans", "Transform"},
+        {"Obj", "GameObject"},
+    };
+
+    private static UnityEngine.Object GetObjByAttrType(Transform child, string typeName)
+    {
+        if (typeName == "Image")
+            return child.GetComponent<Image>();
+        else if (typeName == "Text")
+            return child.GetComponent<Text>();
+        else if (typeName == "Transform")
+            return child;
+        else if (typeName == "GameObject")
+            return child.gameObject;
+        return null;
+    }
+
+    private static string prefsKey = "AutoBindScriptField";
+
+    [MenuItem("Custom/Tools/自动生成代码Attach")]
+    public static void AutoBindScriptAttach()
+    {
+        AutoBindScript(true);
+    }
+
+    public static void AutoBindScript(bool isScriptAttach)
+    {
+        if (Selection.gameObjects.Length == 0) return;
+        var selectObj = Selection.gameObjects[0];
+        var attrInfos = GetAttrInfoInGameObject(selectObj);
+        if (attrInfos.Count == 0)
+        {
+            Debug.LogErrorFormat("{0} 没找到要绑定的字段", selectObj.name);
+            return;
+        }
+
+        var selectName = selectObj.name;
+        var path = Application.dataPath + "/Scripts/";
+
+        var filePath = path + selectName + ".cs";
+        if (File.Exists(filePath))
+        {
+            File.Delete(filePath);
+        }
+        var fs = File.Create(filePath);
+        var sw = new StreamWriter(fs, System.Text.Encoding.UTF8);
+        sw.Write(WriteEmptyMono(selectName, attrInfos, isScriptAttach));
+        sw.Flush();
+        sw.Close();
+        fs.Close();
+
+        AssetDatabase.SaveAssets();
+        AssetDatabase.Refresh();
+    }
+
+    [MenuItem("Custom/Tools/自动生成代码并绑定")]
+    public static void AutoBindScriptField()
+    {
+        if (Selection.gameObjects.Length == 0) return;
+        var selectObj = Selection.gameObjects[0];
+        AutoBindScript(false);
+        EditorPrefs.SetString(prefsKey, selectObj.name);
+    }
+
+    [DidReloadScripts]
+    private static void DidReloadScriptsBindScriptToObj()
+    {
+        var objName = EditorPrefs.GetString(prefsKey);
+        if (string.IsNullOrEmpty(objName)) return;
+        BindScriptToObj();
+        EditorPrefs.DeleteKey(prefsKey);
+    }
+
+    [MenuItem("Custom/Tools/代码绑定到预制体")]
+    private static void BindScriptToObj()
+    {
+        if (Selection.gameObjects.Length == 0) return;
+        var selectObj = Selection.gameObjects[0];
+        var attrInfos = GetAttrInfoInGameObject(selectObj);
+        if (attrInfos.Count == 0)
+        {
+            Debug.LogErrorFormat("{0} 没找到要绑定的字段", selectObj.name);
+            return;
+        }
+        var objName = selectObj.name;
+        var assemblies = AppDomain.CurrentDomain.GetAssemblies();
+        var defaultAssembly = assemblies.First(assembly => assembly.GetName().Name == "Assembly-CSharp");
+        var typeName = string.IsNullOrEmpty(NamespaceStr) ? objName : NamespaceStr + "." + objName;
+
+        var type = defaultAssembly.GetType(typeName);
+        if (type == null)
+        {
+            Debug.LogFormat("获取{0}失败", typeName);
+            return;
+        }
+        Debug.Log(type);
+
+        var scriptComponent = selectObj.GetComponent(type);
+        if (!scriptComponent)
+        {
+            scriptComponent = selectObj.AddComponent(type);
+        }
+
+        BindScriptField(type, scriptComponent, selectObj, attrInfos);
+        AssetDatabase.SaveAssets();
+        AssetDatabase.Refresh();
+    }
+
+    private static void BindScriptField(Type type, Component component, GameObject obj, List<BindAttrInfo> bindAttrInfos)
+    {
+        FieldInfo[] fieldInfos = type.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        for (int i = 0; i < fieldInfos.Length; i++)
+        {
+            var fieldInfo = fieldInfos[i];
+            var arrtInfos = bindAttrInfos.FindAll(t => t.attrName == fieldInfo.Name);
+            if (arrtInfos.Count != 1)
+            {
+                Debug.LogErrorFormat("bindAttrInfos含有{0}个{1}!", arrtInfos.Count, fieldInfo.Name);
+                continue;
+            }
+            var arrtInfo = arrtInfos[0];
+            Debug.Log(arrtInfo.path);
+            var child = obj.transform.Find(arrtInfo.path);
+            var childObj = GetObjByAttrType(child, arrtInfo.typeName);
+            if (childObj != null)
+            {
+                fieldInfo.SetValue(component, childObj);
+            }
+            else
+                Debug.LogErrorFormat("{0} bind {1} error!", arrtInfo.objName, arrtInfo.typeName);
+        }
+    }
+
+    private static List<BindAttrInfo> GetAttrInfoInGameObject(GameObject obj)
+    {
+        string name = obj.name;
+        var childs = obj.GetComponentsInChildren<Transform>(true);
+        var attrInfos = new List<BindAttrInfo>();
+        for (int i = 0; i < childs.Length; i++)
+        {
+            var child = childs[i];
+            var childName = child.name;
+            if (childName.Contains("_"))
+            {
+                var nameKey = childName.Split('_')[0];
+                if (bindTypeDic.TryGetValue(nameKey, out string nameVale))
+                {
+                    Transform targetTrans = child;
+                    string path = childName;
+                    while (targetTrans.parent != obj.transform)
+                    {
+                        targetTrans = targetTrans.parent;
+                        path = string.Format("{0}/{1}", targetTrans.name, path);
+                    }
+                    var bindAttrInfo = new BindAttrInfo();
+                    bindAttrInfo.typeName = nameVale;
+                    bindAttrInfo.attrName = GetScriptFieldName(childName);
+                    bindAttrInfo.objName = childName;
+                    bindAttrInfo.path = path;
+                    attrInfos.Add(bindAttrInfo);
+                }
+            }
+        }
+        return attrInfos;
+    }
+
+    private static string GetScriptFieldName(string str)
+    {
+        return str;
+    }
+
+    public static string NamespaceStr = "Game";
+    private static string WriteEmptyMono(string className, List<BindAttrInfo> attrInfos, bool isScriptAttach)
+    {
+        var sb = new StringBuilder();
+        sb.Append("using System;\n");
+        sb.Append("using System.Collections;\n");
+        sb.Append("using UnityEngine;\n");
+        sb.Append("using UnityEngine.UI;\n");
+        sb.Append("\n");
+        sb.AppendFormat("namespace {0}\n", NamespaceStr);
+        sb.Append("{\n");
+
+        sb.AppendFormat("\tpublic class {0} : MonoBehaviour\n", className);
+        sb.Append("\t{\n");
+
+        for (int i = 0; i < attrInfos.Count; i++)
+        {
+            var attrInfo = attrInfos[i];
+            sb.AppendFormat("\t\tpublic {0} {1};\n", attrInfo.typeName, attrInfo.attrName);
+        }
+        sb.Append("\n");
+
+        if (isScriptAttach)
+        {
+            sb.Append("\t\tpublic void AttachObj()\n");
+            sb.Append("\t\t{\n");
+            for (int i = 0; i < attrInfos.Count; i++)
+            {
+                var attrInfo = attrInfos[i];
+                if (attrInfo.typeName == "Transform")
+                    sb.AppendFormat("\t\t\t{0} = transform.Find(\"{1}\");\n", attrInfo.attrName, attrInfo.path, attrInfo.typeName);
+                else if (attrInfo.typeName == "GameObject")
+                    sb.AppendFormat("\t\t\t{0} = transform.Find(\"{1}\").gameObject;\n", attrInfo.attrName, attrInfo.path, attrInfo.typeName);
+                else
+                    sb.AppendFormat("\t\t\t{0} = transform.Find(\"{1}\").GetComponent<{2}>();\n", attrInfo.attrName, attrInfo.path, attrInfo.typeName);
+            }
+            sb.Append("\t\t}\n");
+            sb.Append("\n");
+        }
+
+        sb.Append("\t}\n");
+        sb.Append("}");
+        return sb.ToString();
+    }
+
+}
+
+
+public class BindAttrInfo
+{
+    /// <summary>
+    /// 变量类型
+    /// </summary>
+    public string typeName;
+    /// <summary>
+    /// 文件中变量名
+    /// </summary>
+    public string attrName;
+    /// <summary>
+    /// 游戏物体名
+    /// </summary>
+    public string objName;
+    /// <summary>
+    /// 父节点的路径
+    /// </summary>
+    public string path;
+}
